@@ -1,0 +1,112 @@
+version: 2
+
+models:
+  - name: stg_customers
+    description: One row per policyholder.
+    columns:
+      - name: customer_id
+        tests: [unique, not_null]
+      - name: email
+        tests: [not_null]
+
+  - name: stg_agents
+    description: One row per selling agent.
+    columns:
+      - name: agent_id
+        tests: [unique, not_null]
+
+  - name: stg_products
+    description: Insurance product catalogue.
+    columns:
+      - name: product_id
+        tests: [unique, not_null]
+      - name: line_of_business
+        tests:
+          - accepted_values:
+              values: ["AUTO", "HOME", "LIFE", "UMBRELLA"]
+
+  - name: stg_policies
+    description: One row per policy.
+    columns:
+      - name: policy_id
+        tests: [unique, not_null]
+      - name: policy_number
+        tests: [unique, not_null]
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+      - name: agent_id
+        tests:
+          - relationships:
+              to: ref('stg_agents')
+              field: agent_id
+      - name: product_id
+        tests:
+          - relationships:
+              to: ref('stg_products')
+              field: product_id
+      - name: policy_status
+        tests:
+          - accepted_values:
+              values: ["ACTIVE", "EXPIRED", "LAPSED", "CANCELLED"]
+      - name: payment_frequency
+        tests:
+          - accepted_values:
+              values: ["ANNUAL", "SEMIANNUAL", "QUARTERLY", "MONTHLY"]
+
+  - name: stg_premium_payments
+    description: One row per premium installment.
+    columns:
+      - name: premium_payment_id
+        tests: [unique, not_null]
+      - name: policy_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_policies')
+              field: policy_id
+      - name: payment_status
+        tests:
+          - accepted_values:
+              values: ["PAID", "PENDING", "LATE", "FAILED"]
+
+  - name: stg_claims
+    description: One row per claim.
+    columns:
+      - name: claim_id
+        tests: [unique, not_null]
+      - name: claim_number
+        tests: [unique, not_null]
+      - name: policy_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_policies')
+              field: policy_id
+      - name: claim_status
+        tests:
+          - accepted_values:
+              values: ["OPEN", "IN_REVIEW", "APPROVED", "DENIED", "CLOSED"]
+      - name: reported_date
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: ">= incident_date"
+
+  - name: stg_claim_payments
+    description: One row per payment made against a claim.
+    columns:
+      - name: claim_payment_id
+        tests: [unique, not_null]
+      - name: claim_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_claims')
+              field: claim_id
+      - name: payment_type
+        tests:
+          - accepted_values:
+              values: ["INDEMNITY", "EXPENSE"]

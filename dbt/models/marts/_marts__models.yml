@@ -1,0 +1,58 @@
+version: 2
+
+models:
+  - name: dim_customers
+    description: Customer dimension with policy roll-ups.
+    columns:
+      - name: customer_id
+        tests: [unique, not_null]
+      - name: policy_count
+        tests: [not_null]
+
+  - name: dim_policies
+    description: Policy dimension enriched with customer, agent and product attributes.
+    columns:
+      - name: policy_id
+        tests: [unique, not_null]
+      - name: customer_id
+        tests:
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+      - name: line_of_business
+        tests:
+          - accepted_values:
+              values: ["AUTO", "HOME", "LIFE", "UMBRELLA"]
+
+  - name: fct_claims
+    description: One row per claim, with policy context and claim-payment roll-ups.
+    columns:
+      - name: claim_id
+        tests: [unique, not_null]
+      - name: policy_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_policies')
+              field: policy_id
+      - name: paid_amount
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+      # The seed guarantees INDEMNITY payments reconcile to claims.paid_amount.
+      - name: claim_payments_indemnity
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "= paid_amount"
+
+  - name: fct_premium_payments
+    description: One row per premium installment, with policy context.
+    columns:
+      - name: premium_payment_id
+        tests: [unique, not_null]
+      - name: policy_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_policies')
+              field: policy_id

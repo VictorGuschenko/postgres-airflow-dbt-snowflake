@@ -1,11 +1,17 @@
 version: 2
 
-# Define the raw Snowflake tables that Airflow loads, then build staging models
-# on top of them. Placeholder — fill in once the source schema is defined.
-#
-# sources:
-#   - name: raw
-#     database: RAW
-#     schema: PUBLIC
-#     tables:
-#       - name: customers
+sources:
+  - name: raw
+    database: "{{ env_var('SNOWFLAKE_DATABASE', 'ANALYTICS_DB') }}"
+    schema: RAW
+    description: >
+      One-to-one landing copies of the source_postgres `app.*` insurance tables,
+      loaded by the Airflow `postgres_to_snowflake` DAG (full snapshot each run).
+    tables:
+      - name: customers
+      - name: agents
+      - name: products
+      - name: policies
+      - name: premium_payments
+      - name: claims
+      - name: claim_payments
