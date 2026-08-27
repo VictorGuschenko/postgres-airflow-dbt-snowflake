@@ -1,0 +1,204 @@
+# Modern data stack — local development stack.
+#
+# Adapted from the official Apache Airflow docker-compose.yaml (v3.3.1), trimmed
+# from CeleryExecutor to LocalExecutor (no Redis / worker / flower) and extended
+# with:
+#   * source_postgres  — the business/source database (mimic data lands here)
+#   * dbt              — build-only image, invoked by Airflow via DockerOperator
+#
+# WARNING: for local development only. Do not use in production.
+#
+# Supported .env variables (see .env.example):
+#   AIRFLOW_IMAGE_NAME, AIRFLOW_UID, AIRFLOW_PROJ_DIR, FERNET_KEY,
+#   _AIRFLOW_WWW_USER_USERNAME, _AIRFLOW_WWW_USER_PASSWORD,
+#   AIRFLOW_CONN_SOURCE_POSTGRES, AIRFLOW_CONN_SNOWFLAKE_DEFAULT,
+#   SNOWFLAKE_* (consumed by the dbt container)
+---
+x-airflow-common:
+  &airflow-common
+  build:
+    context: ./airflow
+    args:
+      AIRFLOW_IMAGE_NAME: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.3.1}
+  image: modern-data-stack/airflow:local
+  env_file:
+    - .env
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}
+    AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    # Host path to this repo, so the DockerOperator can bind-mount ./dbt into the
+    # dbt container it launches on the host Docker daemon.
+    HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:-}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR:-./airflow}/plugins:/opt/airflow/plugins
+    # Shared staging area for extracted files (Postgres -> files -> Snowflake stage).
+    - ./data:/opt/airflow/data
+    # Let Airflow talk to the host Docker daemon to run the dbt container.
+    - /var/run/docker.sock:/var/run/docker.sock
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # --- Airflow metadata database ------------------------------------------------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # --- Source / business database (mimic data lands here) ----------------------
+  source_postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${SOURCE_POSTGRES_USER:-source}
+      POSTGRES_PASSWORD: ${SOURCE_POSTGRES_PASSWORD:-source}
+      POSTGRES_DB: ${SOURCE_POSTGRES_DB:-source}
+    ports:
+      - "${SOURCE_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - source-db-volume:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${SOURCE_POSTGRES_USER:-source}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # --- Airflow services -------------------------------------------------------
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config,data}
+        /entrypoint airflow version
+        /entrypoint airflow config list >/dev/null
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+
+  # --- dbt (build-only image; Airflow runs it via DockerOperator) -------------
+  dbt:
+    build:
+      context: ./dbt
+    image: modern-data-stack/dbt:local
+    profiles:
+      - tools
+    env_file:
+      - .env
+    volumes:
+      - ./dbt:/usr/app
+    working_dir: /usr/app
+    # Override so `docker compose run dbt <cmd>` works for manual use.
+    entrypoint: ["dbt"]
+    command: ["--version"]
+
+volumes:
+  airflow-db-volume:
+  source-db-volume:

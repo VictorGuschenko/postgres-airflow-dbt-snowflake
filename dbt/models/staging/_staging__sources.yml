@@ -1,0 +1,11 @@
+version: 2
+
+# Define the raw Snowflake tables that Airflow loads, then build staging models
+# on top of them. Placeholder — fill in once the source schema is defined.
+#
+# sources:
+#   - name: raw
+#     database: RAW
+#     schema: PUBLIC
+#     tables:
+#       - name: customers
