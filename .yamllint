@@ -1,0 +1,18 @@
+# Lenient YAML lint for dbt schema files and the CI workflow.
+extends: default
+
+ignore: |
+  dbt/dbt_packages/
+  dbt/target/
+  dbt/logs/
+
+rules:
+  line-length: disable
+  document-start: disable
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
