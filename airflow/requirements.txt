@@ -1,0 +1,10 @@
+# Airflow providers — versions resolved by pip against the base image.
+# For reproducible builds, pin these using the Airflow constraints file:
+# https://airflow.apache.org/docs/apache-airflow/3.3.1/installation/installing-from-pypi.html
+apache-airflow-providers-postgres
+apache-airflow-providers-snowflake
+apache-airflow-providers-docker
+
+# Extract / file-staging helpers used by the Postgres -> Snowflake DAG.
+pandas
+pyarrow
