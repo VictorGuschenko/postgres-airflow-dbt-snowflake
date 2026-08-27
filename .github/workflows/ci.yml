@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Offline checks only — no Snowflake connection. Warehouse-connected checks
+# (dbt build against a per-PR schema) come later as a separate workflow.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff yamllint
+      - name: ruff (Python)
+        run: ruff check .
+      - name: yamllint
+        run: yamllint dbt/ .github/ docker-compose.yaml
+
+  dags:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the project Airflow image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./airflow
+          load: true
+          tags: ci-airflow:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: DAGs import without errors
+        run: |
+          docker run --rm \
+            -e AIRFLOW__CORE__LOAD_EXAMPLES=False \
+            -v "$PWD/airflow/dags:/opt/airflow/dags:ro" \
+            ci-airflow:latest \
+            python -c '
+          import sys
+          from airflow.dag_processing.dagbag import DagBag
+          bag = DagBag("/opt/airflow/dags")
+          if bag.import_errors:
+              for path, err in bag.import_errors.items():
+                  print(f"IMPORT ERROR {path}:\n{err}", file=sys.stderr)
+              sys.exit(1)
+          print("OK:", len(bag.dags), "DAG(s):", ", ".join(bag.dags))
+          '
+
+  dbt:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dbt
+    env:
+      DBT_PROFILES_DIR: ${{ github.workspace }}/dbt
+      DBT_TARGET: dev
+      # Dummy values — `dbt parse` renders profiles.yml but never connects.
+      SNOWFLAKE_ACCOUNT: ci-dummy
+      SNOWFLAKE_USER: ci-dummy
+      SNOWFLAKE_PASSWORD: ci-dummy
+      SNOWFLAKE_ROLE: ci-dummy
+      SNOWFLAKE_WAREHOUSE: ci-dummy
+      SNOWFLAKE_DATABASE: ANALYTICS_DB
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "dbt-snowflake~=1.9" "sqlfluff~=3.2"
+      - run: dbt deps
+      - name: dbt parse
+        run: dbt parse
+      - name: sqlfluff lint
+        working-directory: ${{ github.workspace }}
+        run: sqlfluff lint dbt/models

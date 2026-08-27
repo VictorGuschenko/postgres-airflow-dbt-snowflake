@@ -5,7 +5,7 @@ select
     claim_number,
     policy_id,
     claim_type,
-    status                                        as claim_status,
+    status as claim_status,
     incident_date,
     reported_date,
     closed_date,

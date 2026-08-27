@@ -4,8 +4,8 @@
 -- (postgres/init/02_insurance_schema.sql). Column names match exactly; the
 -- DAG's COPY INTO uses MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE.
 --
--- Run in Snowsight AFTER snowflake/bootstrap.sql, or:
---   snow sql -f snowflake/raw_tables.sql
+-- Run in Snowsight AFTER snowflake/bootstrap.sql, once per environment
+-- (set ENV to 'DEV', run; set ENV to 'PROD', run again).
 --
 -- Type mapping:
 --   bigint / int          -> NUMBER(38,0)
@@ -17,13 +17,14 @@
 -- Primary keys are declared for documentation / dbt; Snowflake does not enforce
 -- them (RELY is informational only).
 
-USE DATABASE ANALYTICS_DB;
+SET env = 'DEV';                                  -- 'DEV' or 'PROD'
+USE DATABASE IDENTIFIER('ANALYTICS_DB_' || $env);
 USE SCHEMA RAW;
 
 -- ===================== load objects =====================
 -- Internal named stage the Airflow DAG PUTs extract files to, then COPY INTO
 -- reads from. Name must match SNOWFLAKE_STAGE in
--- airflow/dags/postgres_to_snowflake.py (ANALYTICS_DB.RAW.AIRFLOW_STAGE).
+-- airflow/dags/postgres_to_snowflake.py (ANALYTICS_DB_<ENV>.RAW.AIRFLOW_STAGE).
 CREATE FILE FORMAT IF NOT EXISTS RAW.PARQUET_FORMAT
     TYPE = PARQUET;
 

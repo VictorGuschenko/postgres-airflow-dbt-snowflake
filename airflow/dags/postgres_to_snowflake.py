@@ -8,7 +8,11 @@ Flow:
     dbt_run / dbt_test DockerOperator runs the dbt project against Snowflake
 
 The stage, file format and RAW.* tables are declared in snowflake/raw_tables.sql
-(run that once before triggering the DAG).
+(run that once per environment before triggering the DAG).
+
+Environment: DBT_TARGET (dev | prod, default dev) selects the physical Snowflake
+database <SNOWFLAKE_DATABASE>_<TARGET> for both the RAW load here and the dbt
+run/test tasks. dev and prod are fully separate databases.
 
 Connections (defined via env vars in .env):
     source_postgres      -> AIRFLOW_CONN_SOURCE_POSTGRES
@@ -18,19 +22,22 @@ Connections (defined via env vars in .env):
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pendulum
-from airflow.sdk import dag, task
 from airflow.providers.docker.operators.docker import DockerOperator
+from airflow.sdk import dag, task
 from docker.types import Mount
 
 SOURCE_CONN_ID = "source_postgres"
 SNOWFLAKE_CONN_ID = "snowflake_default"
 DATA_DIR = Path("/opt/airflow/data")
 
-RAW_DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "ANALYTICS_DB")
+# dev | prod — selects the isolated Snowflake database for the whole pipeline.
+DBT_TARGET = os.environ.get("DBT_TARGET", "dev")
+_DB_BASE = os.environ.get("SNOWFLAKE_DATABASE", "ANALYTICS_DB")
+RAW_DATABASE = f"{_DB_BASE}_{DBT_TARGET.upper()}"
 RAW_SCHEMA = os.environ.get("SNOWFLAKE_RAW_SCHEMA", "RAW")
 SNOWFLAKE_STAGE = f"{RAW_DATABASE}.{RAW_SCHEMA}.AIRFLOW_STAGE"
 PARQUET_FORMAT = f"{RAW_DATABASE}.{RAW_SCHEMA}.PARQUET_FORMAT"
@@ -51,7 +58,7 @@ TABLES: dict[str, str] = {
 DBT_IMAGE = "modern-data-stack/dbt:local"
 HOST_PROJECT_DIR = os.environ.get("HOST_PROJECT_DIR", "")
 
-# Snowflake creds forwarded to the dbt container (profiles.yml reads these).
+# Snowflake creds + target forwarded to the dbt container (profiles.yml reads these).
 _DBT_ENV = {
     k: os.environ[k]
     for k in (
@@ -66,6 +73,7 @@ _DBT_ENV = {
     )
     if k in os.environ
 }
+_DBT_ENV["DBT_TARGET"] = DBT_TARGET
 
 _DBT_MOUNTS = (
     [Mount(source=f"{HOST_PROJECT_DIR}/dbt", target="/usr/app", type="bind")]
@@ -93,7 +101,7 @@ def postgres_to_snowflake():
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         engine = PostgresHook(postgres_conn_id=SOURCE_CONN_ID).get_sqlalchemy_engine()
-        run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        run_ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
 
         manifest: dict[str, str] = {}
         for source_table, target in TABLES.items():
@@ -142,7 +150,7 @@ def postgres_to_snowflake():
     dbt_run = DockerOperator(
         task_id="dbt_run",
         image=DBT_IMAGE,
-        command="run",
+        command=f"run --target {DBT_TARGET}",
         environment=_DBT_ENV,
         mounts=_DBT_MOUNTS,
         mount_tmp_dir=False,
@@ -154,7 +162,7 @@ def postgres_to_snowflake():
     dbt_test = DockerOperator(
         task_id="dbt_test",
         image=DBT_IMAGE,
-        command="test",
+        command=f"test --target {DBT_TARGET}",
         environment=_DBT_ENV,
         mounts=_DBT_MOUNTS,
         mount_tmp_dir=False,

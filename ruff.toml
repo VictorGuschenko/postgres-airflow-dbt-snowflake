@@ -1,0 +1,10 @@
+# Lint config for the Airflow DAGs / Python helpers.
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+
+[lint.per-file-ignores]
+# Airflow DAG files define the DAG at import time via a decorated function call.
+"airflow/dags/*.py" = ["E402"]

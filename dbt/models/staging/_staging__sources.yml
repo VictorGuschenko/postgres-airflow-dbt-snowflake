@@ -2,7 +2,7 @@ version: 2
 
 sources:
   - name: raw
-    database: "{{ env_var('SNOWFLAKE_DATABASE', 'ANALYTICS_DB') }}"
+    database: "{{ env_var('SNOWFLAKE_DATABASE', 'ANALYTICS_DB') }}_{{ target.name | upper }}"
     schema: RAW
     description: >
       One-to-one landing copies of the source_postgres `app.*` insurance tables,

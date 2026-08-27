@@ -40,9 +40,12 @@ x-airflow-common:
     # dbt container it launches on the host Docker daemon.
     HOST_PROJECT_DIR: ${HOST_PROJECT_DIR:-}
     # Airflow Snowflake connection, assembled from the single set of SNOWFLAKE_*
-    # vars in .env so credentials live in exactly one place.
-    AIRFLOW_CONN_SNOWFLAKE_DEFAULT: '{"conn_type":"snowflake","login":"${SNOWFLAKE_USER}","password":"${SNOWFLAKE_PASSWORD}","schema":"${SNOWFLAKE_RAW_SCHEMA:-RAW}","extra":{"account":"${SNOWFLAKE_ACCOUNT}","warehouse":"${SNOWFLAKE_WAREHOUSE}","database":"${SNOWFLAKE_DATABASE}","role":"${SNOWFLAKE_ROLE}"}}'
+    # vars in .env so credentials live in exactly one place. The default database
+    # follows the environment (ANALYTICS_DB_<DBT_TARGET>); the DAG also fully
+    # qualifies every object it touches.
+    AIRFLOW_CONN_SNOWFLAKE_DEFAULT: '{"conn_type":"snowflake","login":"${SNOWFLAKE_USER}","password":"${SNOWFLAKE_PASSWORD}","schema":"${SNOWFLAKE_RAW_SCHEMA:-RAW}","extra":{"account":"${SNOWFLAKE_ACCOUNT}","warehouse":"${SNOWFLAKE_WAREHOUSE}","database":"${SNOWFLAKE_DATABASE}_${DBT_TARGET:-dev}","role":"${SNOWFLAKE_ROLE}"}}'
     SNOWFLAKE_RAW_SCHEMA: ${SNOWFLAKE_RAW_SCHEMA:-RAW}
+    DBT_TARGET: ${DBT_TARGET:-dev}
   volumes:
     - ${AIRFLOW_PROJ_DIR:-./airflow}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-./airflow}/logs:/opt/airflow/logs
@@ -196,6 +199,9 @@ services:
       - tools
     env_file:
       - .env
+    environment:
+      # default when .env predates the DBT_TARGET var; overridable on the CLI.
+      DBT_TARGET: ${DBT_TARGET:-dev}
     volumes:
       - ./dbt:/usr/app
     working_dir: /usr/app
