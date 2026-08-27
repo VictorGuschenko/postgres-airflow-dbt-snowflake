@@ -35,14 +35,16 @@ source_postgres ──(Airflow: extract to Parquet)──► ./data
    cp .env.example .env
    # set HOST_PROJECT_DIR to this repo's absolute path
    # set FERNET_KEY (command is in the file)
-   # fill SNOWFLAKE_* and AIRFLOW_CONN_SNOWFLAKE_DEFAULT
+   # fill SNOWFLAKE_* (one place — compose assembles the Airflow connection from these)
    ```
-3. Build and start:
+3. Create the Snowflake objects the config expects — run `snowflake/bootstrap.sql`
+   in Snowsight.
+4. Build and start:
    ```bash
    docker compose build
    docker compose up -d
    ```
-4. Airflow UI: http://localhost:8080 (user/pass from `.env`, default `airflow`/`airflow`).
+5. Airflow UI: http://localhost:8080 (user/pass from `.env`, default `airflow`/`airflow`).
 
 ## Usage
 

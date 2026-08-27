@@ -26,12 +26,16 @@ from docker.types import Mount
 
 SOURCE_CONN_ID = "source_postgres"
 SNOWFLAKE_CONN_ID = "snowflake_default"
-SNOWFLAKE_STAGE = "RAW.PUBLIC.AIRFLOW_STAGE"
 DATA_DIR = Path("/opt/airflow/data")
 
-# table name in Postgres (schema-qualified) -> target table in Snowflake RAW
+RAW_DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "ANALYTICS_DB")
+RAW_SCHEMA = os.environ.get("SNOWFLAKE_RAW_SCHEMA", "RAW")
+SNOWFLAKE_STAGE = f"{RAW_DATABASE}.{RAW_SCHEMA}.AIRFLOW_STAGE"
+
+# source table in Postgres (schema-qualified) -> raw table name in Snowflake
+# (created under {RAW_DATABASE}.{RAW_SCHEMA})
 TABLES: dict[str, str] = {
-    # "app.customers": "RAW.PUBLIC.CUSTOMERS",
+    # "app.customers": "CUSTOMERS",
 }
 
 DBT_IMAGE = "modern-data-stack/dbt:local"
@@ -106,7 +110,7 @@ def postgres_to_snowflake():
             pattern = source_table.replace(".", "__")
             hook.run(
                 f"""
-                COPY INTO {target_table}
+                COPY INTO {RAW_DATABASE}.{RAW_SCHEMA}.{target_table}
                 FROM @{SNOWFLAKE_STAGE}
                 PATTERN = '.*{pattern}.*\\.parquet'
                 FILE_FORMAT = (TYPE = PARQUET)
