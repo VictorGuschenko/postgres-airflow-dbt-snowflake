@@ -79,16 +79,16 @@ services:
   source_postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: ${SOURCE_POSTGRES_USER:-source}
-      POSTGRES_PASSWORD: ${SOURCE_POSTGRES_PASSWORD:-source}
-      POSTGRES_DB: ${SOURCE_POSTGRES_DB:-source}
+      POSTGRES_USER: ${SOURCE_POSTGRES_USER:-insurance_app}
+      POSTGRES_PASSWORD: ${SOURCE_POSTGRES_PASSWORD:-insurance_app}
+      POSTGRES_DB: ${SOURCE_POSTGRES_DB:-insurance}
     ports:
       - "${SOURCE_POSTGRES_PORT:-5433}:5432"
     volumes:
       - source-db-volume:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${SOURCE_POSTGRES_USER:-source}"]
+      test: ["CMD", "pg_isready", "-U", "${SOURCE_POSTGRES_USER:-insurance_app}"]
       interval: 10s
       retries: 5
       start_period: 5s
