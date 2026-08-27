@@ -1,12 +1,14 @@
 """Postgres -> files -> Snowflake stage -> COPY INTO -> dbt.
 
-SKELETON. Fill in TABLES and the COPY/model details once the source schema is
-defined. The flow:
+Flow:
 
-    extract_to_files   PostgresHook reads each table, writes Parquet to /opt/airflow/data
-    upload_to_stage    SnowflakeHook PUTs the files to an internal named stage
-    copy_into_raw      COPY INTO RAW.<table> FROM @stage
+    extract_to_files   PostgresHook reads each source table, writes Parquet to /opt/airflow/data
+    upload_to_stage    SnowflakeHook PUTs the files to the internal named stage RAW.AIRFLOW_STAGE
+    copy_into_raw      TRUNCATE + COPY INTO RAW.<table> FROM @stage/<file> (full snapshot, 1:1)
     dbt_run / dbt_test DockerOperator runs the dbt project against Snowflake
+
+The stage, file format and RAW.* tables are declared in snowflake/raw_tables.sql
+(run that once before triggering the DAG).
 
 Connections (defined via env vars in .env):
     source_postgres      -> AIRFLOW_CONN_SOURCE_POSTGRES
@@ -16,7 +18,7 @@ Connections (defined via env vars in .env):
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pendulum
@@ -31,11 +33,19 @@ DATA_DIR = Path("/opt/airflow/data")
 RAW_DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "ANALYTICS_DB")
 RAW_SCHEMA = os.environ.get("SNOWFLAKE_RAW_SCHEMA", "RAW")
 SNOWFLAKE_STAGE = f"{RAW_DATABASE}.{RAW_SCHEMA}.AIRFLOW_STAGE"
+PARQUET_FORMAT = f"{RAW_DATABASE}.{RAW_SCHEMA}.PARQUET_FORMAT"
 
-# source table in Postgres (schema-qualified) -> raw table name in Snowflake
-# (created under {RAW_DATABASE}.{RAW_SCHEMA})
+# source table in Postgres (schema-qualified) -> raw table name in Snowflake,
+# under {RAW_DATABASE}.{RAW_SCHEMA}. Load order does not matter (full snapshot,
+# no FKs enforced in RAW).
 TABLES: dict[str, str] = {
-    # "app.customers": "CUSTOMERS",
+    "app.customers": "CUSTOMERS",
+    "app.agents": "AGENTS",
+    "app.products": "PRODUCTS",
+    "app.policies": "POLICIES",
+    "app.premium_payments": "PREMIUM_PAYMENTS",
+    "app.claims": "CLAIMS",
+    "app.claim_payments": "CLAIM_PAYMENTS",
 }
 
 DBT_IMAGE = "modern-data-stack/dbt:local"
@@ -57,64 +67,75 @@ _DBT_ENV = {
     if k in os.environ
 }
 
+_DBT_MOUNTS = (
+    [Mount(source=f"{HOST_PROJECT_DIR}/dbt", target="/usr/app", type="bind")]
+    if HOST_PROJECT_DIR
+    else []
+)
+
 
 @dag(
     dag_id="postgres_to_snowflake",
-    schedule=None,  # trigger manually until the pipeline is fleshed out
+    schedule=None,  # trigger manually
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     tags=["elt", "snowflake", "dbt"],
 )
 def postgres_to_snowflake():
     @task
-    def extract_to_files() -> list[str]:
-        """Read each source table into a Parquet file under DATA_DIR."""
+    def extract_to_files() -> dict[str, str]:
+        """Read each source table into a Parquet file. Returns {TARGET: filename}."""
+        import pandas as pd
         from airflow.providers.postgres.hooks.postgres import PostgresHook
 
         if not TABLES:
             raise ValueError("TABLES is empty — define the source tables first.")
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        hook = PostgresHook(postgres_conn_id=SOURCE_CONN_ID)
-        engine = hook.get_sqlalchemy_engine()
-        written: list[str] = []
-        run_ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        engine = PostgresHook(postgres_conn_id=SOURCE_CONN_ID).get_sqlalchemy_engine()
+        run_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
-        import pandas as pd
-
-        for source_table in TABLES:
+        manifest: dict[str, str] = {}
+        for source_table, target in TABLES.items():
+            # NUMERIC columns arrive as Python Decimal (object dtype); pyarrow
+            # writes them as decimal128, so exact values are preserved. Do NOT
+            # coerce these columns to float.
             df = pd.read_sql(f"SELECT * FROM {source_table}", engine)
-            safe = source_table.replace(".", "__")
-            out = DATA_DIR / f"{safe}_{run_ts}.parquet"
-            df.to_parquet(out, index=False)
-            written.append(str(out))
-        return written
+            fname = f"{target}_{run_ts}.parquet"
+            df.to_parquet(DATA_DIR / fname, index=False)
+            manifest[target] = fname
+            print(f"{source_table}: {len(df)} rows -> {fname}")
+        return manifest
 
     @task
-    def upload_to_stage(files: list[str]) -> None:
+    def upload_to_stage(manifest: dict[str, str]) -> dict[str, str]:
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        hook.run(f"CREATE STAGE IF NOT EXISTS {SNOWFLAKE_STAGE}")
-        for f in files:
+        for fname in manifest.values():
+            # Parquet is already compressed; AUTO_COMPRESS=FALSE keeps the name
+            # stable so COPY can address the file directly.
             hook.run(
-                f"PUT file://{f} @{SNOWFLAKE_STAGE} AUTO_COMPRESS=TRUE OVERWRITE=TRUE"
+                f"PUT file://{DATA_DIR / fname} @{SNOWFLAKE_STAGE} "
+                f"AUTO_COMPRESS=FALSE OVERWRITE=TRUE"
             )
+        return manifest
 
     @task
-    def copy_into_raw() -> None:
+    def copy_into_raw(manifest: dict[str, str]) -> None:
         from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 
         hook = SnowflakeHook(snowflake_conn_id=SNOWFLAKE_CONN_ID)
-        for source_table, target_table in TABLES.items():
-            pattern = source_table.replace(".", "__")
+        for target, fname in manifest.items():
+            fqtn = f"{RAW_DATABASE}.{RAW_SCHEMA}.{target}"
+            hook.run(f"TRUNCATE TABLE {fqtn}")
             hook.run(
                 f"""
-                COPY INTO {RAW_DATABASE}.{RAW_SCHEMA}.{target_table}
-                FROM @{SNOWFLAKE_STAGE}
-                PATTERN = '.*{pattern}.*\\.parquet'
-                FILE_FORMAT = (TYPE = PARQUET)
+                COPY INTO {fqtn}
+                FROM @{SNOWFLAKE_STAGE}/{fname}
+                FILE_FORMAT = (FORMAT_NAME = {PARQUET_FORMAT})
                 MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+                ON_ERROR = ABORT_STATEMENT
                 """
             )
 
@@ -123,11 +144,7 @@ def postgres_to_snowflake():
         image=DBT_IMAGE,
         command="run",
         environment=_DBT_ENV,
-        mounts=(
-            [Mount(source=f"{HOST_PROJECT_DIR}/dbt", target="/usr/app", type="bind")]
-            if HOST_PROJECT_DIR
-            else []
-        ),
+        mounts=_DBT_MOUNTS,
         mount_tmp_dir=False,
         docker_url="unix://var/run/docker.sock",
         network_mode="bridge",
@@ -139,19 +156,15 @@ def postgres_to_snowflake():
         image=DBT_IMAGE,
         command="test",
         environment=_DBT_ENV,
-        mounts=(
-            [Mount(source=f"{HOST_PROJECT_DIR}/dbt", target="/usr/app", type="bind")]
-            if HOST_PROJECT_DIR
-            else []
-        ),
+        mounts=_DBT_MOUNTS,
         mount_tmp_dir=False,
         docker_url="unix://var/run/docker.sock",
         network_mode="bridge",
         auto_remove="success",
     )
 
-    files = extract_to_files()
-    upload_to_stage(files) >> copy_into_raw() >> dbt_run >> dbt_test
+    manifest = extract_to_files()
+    copy_into_raw(upload_to_stage(manifest)) >> dbt_run >> dbt_test
 
 
 postgres_to_snowflake()

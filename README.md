@@ -1,83 +1,420 @@
 # postgres-airflow-dbt-snowflake
 
-Learning project for the modern data stack — Postgres as source, Airflow
-orchestration, dbt transformations, Snowflake warehouse.
-
-## Architecture
+A hands-on **learning project for the modern data stack**. It moves a fictional
+Property & Casualty insurer's data from an operational Postgres database into
+Snowflake and models it with dbt, all orchestrated by Airflow and run locally on
+Docker.
 
 ```
-source_postgres ──(Airflow: extract to Parquet)──► ./data
-      │                                               │
-      │                                    (Airflow: PUT to stage + COPY INTO)
-      ▼                                               ▼
-  mimic data                                    Snowflake RAW
-                                                      │
-                                          (Airflow → DockerOperator → dbt)
-                                                      ▼
-                                          Snowflake STAGING / MARTS
+source_postgres          Airflow DAG: postgres_to_snowflake                 Snowflake (ANALYTICS_DB)
+  schema app     ──►  extract_to_files ──► upload_to_stage ──► copy_into_raw ──►  RAW.*         (1:1 copy)
+  7 tables            (Parquet →           (PUT →              (TRUNCATE +          │
+  ~1k policies         ./data)              @RAW.AIRFLOW_STAGE)  COPY INTO)         ▼
+                                                              dbt_run ──────────►  ANALYTICS_STAGING  (stg_* views)
+                                                              dbt_test ─────────►  ANALYTICS_MARTS    (dim_/fct_ tables)
 ```
+
+**What you practise here:** containerised orchestration, an ELT (not ETL)
+pattern, loading Snowflake from an internal stage, why Parquet beats CSV for
+type-faithful loads, and a small but complete dbt project (sources → staging →
+marts) with data tests.
+
+---
+
+## 1. What's in the box
+
+### Tooling / versions
+
+| Component | Version | Role |
+| --- | --- | --- |
+| Apache Airflow | 3.3.1, `LocalExecutor` | Orchestration (no Celery/Redis) |
+| Postgres | 16 | Source database **and** Airflow metadata DB (separate containers) |
+| dbt-core / dbt-snowflake | 1.12.x | Transformations in Snowflake |
+| Snowflake | — | Cloud warehouse (you bring an account) |
+| Docker Compose | — | Runs everything except Snowflake |
 
 ### Containers (`docker compose`)
 
-| Service | Purpose | Port |
+| Service | Purpose | Host port |
 | --- | --- | --- |
-| `source_postgres` | Business/source database; mimic data lands here | `5433` |
-| `postgres` | Airflow metadata database | — |
+| `source_postgres` | The business/source database; mimic data lands here | `5433` |
+| `postgres` | Airflow's own metadata database | — |
 | `airflow-apiserver` | Airflow UI + REST API | `8080` |
-| `airflow-scheduler` / `-dag-processor` / `-triggerer` | Airflow core (LocalExecutor) | — |
-| `dbt` | Build-only image (`dbt-snowflake`); Airflow runs it via `DockerOperator` | — |
+| `airflow-scheduler` | Schedules and runs tasks | — |
+| `airflow-dag-processor` | Parses DAG files | — |
+| `airflow-triggerer` | Runs deferrable operators | — |
+| `airflow-init` | One-shot: DB migrate + create admin user, then exits | — |
+| `dbt` | Build-only image; Airflow runs it on demand via `DockerOperator` | — |
 
-## Setup
+`dbt` sits behind a Compose profile, so `docker compose up` does **not** start it
+as a long-running service. Airflow's `DockerOperator` launches a fresh `dbt`
+container per task using the host Docker socket (mounted into the Airflow
+containers).
 
-1. Install Docker Desktop and make sure `docker` / `docker compose` are on your PATH.
-2. Copy env and fill in Snowflake credentials:
-   ```bash
-   cp .env.example .env
-   # set HOST_PROJECT_DIR to this repo's absolute path
-   # set FERNET_KEY (command is in the file)
-   # fill SNOWFLAKE_* (one place — compose assembles the Airflow connection from these)
-   ```
-3. Create the Snowflake objects the config expects — run `snowflake/bootstrap.sql`
-   in Snowsight.
-4. Build and start:
-   ```bash
-   docker compose build
-   docker compose up -d
-   ```
-5. Airflow UI: http://localhost:8080 (user/pass from `.env`, default `airflow`/`airflow`).
+### Source domain (`source_postgres`, schema `app`)
 
-## Usage
-
-- **Source DB**: `psql postgresql://source:source@localhost:5433/source`. Schema and
-  seed/mimic data go in `postgres/init/` (runs once on first container start) or via
-  a dedicated DAG later.
-- **dbt manually**:
-  ```bash
-  docker compose run --rm dbt deps
-  docker compose run --rm dbt run
-  docker compose run --rm dbt test
-  ```
-- **Pipeline**: trigger the `postgres_to_snowflake` DAG in the Airflow UI. It is a
-  skeleton — populate `TABLES` in `airflow/dags/postgres_to_snowflake.py` and the
-  dbt models once the business domain is defined.
-
-## Layout
+A small P&C insurance model. Parent → child:
 
 ```
+customers   agents   products
+     └────────┬─────────┘
+           policies ──┬── premium_payments      (billing installments)
+                      └── claims ── claim_payments  (indemnity + expense)
+```
+
+| Table | Rows | Grain |
+| --- | ---: | --- |
+| `customers` | 800 | one policyholder |
+| `agents` | 30 | one selling agent |
+| `products` | 6 | AUTO ×2, HOME ×2, LIFE, UMBRELLA |
+| `policies` | 1,000 | one policy (1-year terms, statuses ACTIVE/EXPIRED/LAPSED/CANCELLED) |
+| `premium_payments` | ~2,700 | one installment (first ≤4 per policy) |
+| `claims` | 400 | one claim |
+| `claim_payments` | ~350 | one payment against a claim |
+
+The data is generated by **pure SQL** with `setseed()` fixed, so every rebuild
+produces byte-identical data. Built-in invariants you can rely on in tests:
+INDEMNITY claim payments sum exactly to `claims.paid_amount`; no orphan foreign
+keys; no event dated in the future; `reported_date >= incident_date`.
+
+### Snowflake objects
+
+| Object | Created by | Notes |
+| --- | --- | --- |
+| Warehouse `COMPUTE_WH` | `snowflake/bootstrap.sql` | XSMALL, auto-suspend 60s |
+| Database `ANALYTICS_DB` | `snowflake/bootstrap.sql` | |
+| Schema `RAW` | `snowflake/bootstrap.sql` | landing zone |
+| Schema `ANALYTICS` | `snowflake/bootstrap.sql` | dbt's target base schema |
+| `RAW.*` (7 tables) | `snowflake/raw_tables.sql` | column-for-column copies of `app.*` + a `_loaded_at` audit column |
+| `RAW.AIRFLOW_STAGE` | `snowflake/raw_tables.sql` | internal named stage the DAG `PUT`s to |
+| `RAW.PARQUET_FORMAT` | `snowflake/raw_tables.sql` | `TYPE = PARQUET` file format |
+| `ANALYTICS_STAGING` / `ANALYTICS_MARTS` | dbt (automatically) | schema-per-layer via `dbt_project.yml` |
+
+### dbt project (`dbt/`)
+
+```
+models/staging/   stg_customers, stg_agents, stg_products, stg_policies,
+                  stg_premium_payments, stg_claims, stg_claim_payments
+                  → views in ANALYTICS_STAGING; 1:1 with RAW, light renames only
+models/marts/     dim_customers, dim_policies, fct_claims, fct_premium_payments
+                  → tables in ANALYTICS_MARTS; joins + roll-ups + derived measures
+```
+
+`_staging__sources.yml` declares the 7 `RAW` tables as a dbt source; the
+`_*__models.yml` files carry ~53 tests (`unique`, `not_null`, `relationships`,
+`accepted_values`, and a `dbt_utils.expression_is_true` reconciliation check).
+
+### The Airflow DAG (`airflow/dags/postgres_to_snowflake.py`)
+
+`dag_id = postgres_to_snowflake`, `schedule=None` (manual trigger).
+
+| Task | What it does |
+| --- | --- |
+| `extract_to_files` | `PostgresHook` → `pandas.read_sql` each `app.*` table → one Parquet file per table in `/opt/airflow/data`. Returns a `{TARGET: filename}` manifest via XCom. |
+| `upload_to_stage` | `SnowflakeHook` runs `PUT file://… @RAW.AIRFLOW_STAGE AUTO_COMPRESS=FALSE OVERWRITE=TRUE` for each file. |
+| `copy_into_raw` | For each table: `TRUNCATE TABLE RAW.<T>` then `COPY INTO RAW.<T> FROM @stage/<file> FILE_FORMAT=(FORMAT_NAME=RAW.PARQUET_FORMAT) MATCH_BY_COLUMN_NAME=CASE_INSENSITIVE`. Full snapshot, so re-runs are idempotent. |
+| `dbt_run` | `DockerOperator` starts a `dbt` container, `dbt run` against Snowflake. |
+| `dbt_test` | Same, `dbt test`. |
+
+---
+
+## 2. Prerequisites
+
+- **Docker Desktop** (or any Docker engine + Compose v2).
+- **A Snowflake account.** A [free 30-day trial](https://signup.snowflake.com/)
+  is enough; you need the account identifier (`<orgname>-<account_name>`), a
+  user, and a password. `ACCOUNTADMIN` keeps the bootstrap simple.
+- ~4 GB free disk for the images (the Airflow image is ~3 GB).
+- Optional: [`snow` CLI](https://docs.snowflake.com/en/developer-guide/snowflake-cli/index)
+  to run the Snowflake SQL files from your terminal. Otherwise paste them into
+  a Snowsight worksheet.
+
+---
+
+## 3. Walkthrough — repeat it from scratch
+
+Each phase says **what** to do and **why** it matters.
+
+### Phase 1 — Bring up the local stack
+
+```bash
+git clone <this repo> && cd postgres-airflow-dbt-snowflake
+cp .env.example .env
+```
+
+Edit `.env`:
+
+| Variable | How to set it |
+| --- | --- |
+| `HOST_PROJECT_DIR` | Absolute path to this repo. The `DockerOperator` needs it to bind-mount `./dbt` into the dbt container it starts on the host. |
+| `FERNET_KEY` | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` — encrypts Airflow connection secrets. |
+| `_AIRFLOW_WWW_USER_PASSWORD`, `SOURCE_POSTGRES_PASSWORD` | Replace the `change-me` placeholders. Keep `AIRFLOW_CONN_SOURCE_POSTGRES` in sync with the `SOURCE_POSTGRES_*` values. |
+| `SNOWFLAKE_ACCOUNT` / `SNOWFLAKE_USER` / `SNOWFLAKE_PASSWORD` | Your Snowflake login. **These live in exactly one place** — `docker-compose.yaml` assembles the Airflow `snowflake_default` connection from them, and dbt's `profiles.yml` reads the same variables. |
+
+```bash
+docker compose build          # builds the custom airflow + dbt images
+docker compose up -d
+docker compose ps             # wait until every service is "healthy"
+```
+
+*Why a custom Airflow image?* It bakes in the `postgres`, `snowflake`, and
+`docker` providers plus `pandas`/`pyarrow` (see `airflow/requirements.txt`).
+*Why `LocalExecutor`?* One machine, no need for Celery/Redis; tasks run as
+subprocesses of the scheduler.
+
+Airflow UI: <http://localhost:8080> (the `_AIRFLOW_WWW_USER_*` values from
+`.env`; `.env.example` ships `admin` / `change-me`).
+
+### Phase 2 — Create the Snowflake objects
+
+```bash
+snow sql -f snowflake/bootstrap.sql     # warehouse, database, RAW + ANALYTICS schemas
+snow sql -f snowflake/raw_tables.sql    # RAW.* tables, AIRFLOW_STAGE, PARQUET_FORMAT
+```
+
+(or paste both files into Snowsight). `raw_tables.sql` is safe to re-run —
+tables are `CREATE OR REPLACE`, the stage/format are `CREATE … IF NOT EXISTS`.
+
+*Why declare `RAW.*` by hand* instead of letting `COPY` infer them? A "one-to-one"
+load means **you** own the target types. `bigint → NUMBER(38,0)`,
+`numeric(p,s) → NUMBER(p,s)`, `timestamptz → TIMESTAMP_TZ`, etc. Inference would
+guess, and guesses drift between runs.
+
+### Phase 3 — Verify every connection
+
+```bash
+docker compose exec airflow-scheduler bash -lc 'airflow db check'   # metadata DB
+./scripts/check_connections.sh                                       # all 5 hops
+```
+
+`check_connections.sh` proves: Airflow → metadata Postgres, Airflow →
+`source_postgres`, Airflow → Snowflake, Airflow → the host Docker daemon (needed
+for `DockerOperator`), and dbt → Snowflake (`dbt debug`). Fix any red line here
+before running the DAG.
+
+### Phase 4 — Understand the source data
+
+`postgres/init/*.sql` runs **once**, automatically, the first time
+`source_postgres` starts with an empty data directory:
+
+| File | Purpose |
+| --- | --- |
+| `01_init.sql` | creates schema `app` |
+| `02_insurance_schema.sql` | the 7 tables, PKs, FKs, indexes |
+| `03_insurance_seed.sql` | `setseed(0.4242)` + deterministic `INSERT … SELECT generate_series(...)` |
+
+To regenerate on an already-running container (the init hook won't fire again):
+
+```bash
+# use the SOURCE_POSTGRES_* user / db you set in .env (.env.example: insurance_app / insurance)
+docker compose exec -T source_postgres psql -U insurance_app -d insurance \
+  -f /docker-entrypoint-initdb.d/02_insurance_schema.sql
+docker compose exec -T source_postgres psql -U insurance_app -d insurance \
+  -f /docker-entrypoint-initdb.d/03_insurance_seed.sql
+```
+
+To start completely fresh: `docker compose down -v` (drops the volumes) then
+`docker compose up -d`.
+
+Poke around:
+
+```bash
+docker compose exec source_postgres psql -U insurance_app -d insurance
+# \dt app.*
+# SELECT status, count(*) FROM app.policies GROUP BY 1;
+```
+
+### Phase 5 — Read the DAG before you run it
+
+Open `airflow/dags/postgres_to_snowflake.py`. Things worth noticing:
+
+- **`TABLES`** is the whole configuration — `{"app.customers": "CUSTOMERS", …}`.
+  Add a source table by adding a line (and a matching `RAW` table + `stg_` model).
+- **XCom manifest.** `extract_to_files` returns `{target: filename}`; the next
+  two tasks consume it. No global state, no filename guessing.
+- **`AUTO_COMPRESS=FALSE`.** Parquet is already compressed; keeping the name
+  stable lets `COPY` address the exact file (`@stage/CUSTOMERS_<ts>.parquet`)
+  instead of a `PATTERN`.
+- **`TRUNCATE` + `COPY`.** This is a *full snapshot* load — simple and idempotent
+  for a learning project. Incremental loading is a later exercise.
+- **`MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE`.** Parquet field names (lowercase,
+  from pandas) match the uppercase Snowflake columns; the extra `_loaded_at`
+  column just takes its `DEFAULT`.
+
+### Phase 6 — Run the pipeline
+
+From the UI: unpause **`postgres_to_snowflake`**, hit ▶ *Trigger*.
+
+Or from the CLI:
+
+```bash
+docker compose exec airflow-scheduler airflow dags unpause postgres_to_snowflake
+docker compose exec airflow-scheduler airflow dags trigger postgres_to_snowflake
+
+# watch it
+docker compose exec airflow-scheduler \
+  airflow tasks states-for-dag-run postgres_to_snowflake <run_id>
+```
+
+A green run ends with `dbt run` `PASS=11` and `dbt test` `PASS=53`.
+
+### Phase 7 — Explore the results in Snowflake
+
+```sql
+USE DATABASE ANALYTICS_DB;
+
+-- RAW is a byte-for-byte copy of Postgres
+SELECT 'RAW' layer, table_name, row_count
+FROM INFORMATION_SCHEMA.TABLES WHERE table_schema = 'RAW';
+
+-- staging = renamed views, marts = modelled tables
+SELECT * FROM ANALYTICS_MARTS.DIM_POLICIES LIMIT 20;
+
+SELECT line_of_business,
+       count(*)                    AS claims,
+       round(sum(paid_amount))     AS paid,
+       round(avg(days_to_close),1) AS avg_days_to_close
+FROM ANALYTICS_MARTS.FCT_CLAIMS
+GROUP BY 1 ORDER BY paid DESC;
+```
+
+### Phase 8 — Change something (exercises)
+
+1. **Add a column** to `app.customers` (e.g. `marital_status`), reseed, add it to
+   `RAW.CUSTOMERS`, `stg_customers`, `dim_customers`. Re-run the DAG.
+2. **Add a mart** — `fct_agent_performance` (policies sold, premium written,
+   loss ratio per agent). Add tests.
+3. **Make `RAW` incremental** — switch `copy_into_raw` from `TRUNCATE`+`COPY` to
+   an `updated_at` high-water mark and a `MERGE`. You'll need an `updated_at`
+   column in the source.
+4. **Schedule it** — set `schedule="@daily"` and `catchup=False`, observe runs.
+5. **Break a test** — change a seed value so the reconciliation test fails, and
+   watch `dbt_test` turn the DAG red.
+
+---
+
+## 4. Design notes
+
+### Why Parquet, not CSV, for the Postgres → Snowflake extract
+
+Both formats work for the `extract → PUT to stage → COPY INTO` pattern. This
+project uses Parquet for a hand-rolled loader that aims to copy tables
+**one-to-one** without tuning a file format per table.
+
+- **Types travel with the data.** Parquet embeds a schema. A Postgres
+  `numeric(10,2)` lands as a Parquet decimal and becomes Snowflake `NUMBER(10,2)`
+  exactly; `timestamptz` keeps its offset; `boolean` stays boolean; `NULL` is
+  unambiguous. In CSV every value is text and Snowflake re-parses it on load —
+  empty-string-vs-`NULL`, timestamp formats, and `t`/`f` booleans from Postgres
+  all become things you have to get right by hand.
+- **Column-name matching.** The DAG loads with
+  `MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE`. Parquet carries field names, so
+  column order and extra target columns (e.g. `_loaded_at`) don't matter. CSV
+  supports that mode only with a header row and `PARSE_HEADER = TRUE`.
+- **Smaller and faster.** Columnar + compressed: less to `PUT`, less for `COPY`
+  to scan. Negligible at ~1k rows, but the pattern scales.
+- **Fewer footguns.** No decisions about quoting, embedded commas/newlines,
+  encoding, or empty string vs `NULL`.
+
+CSV is still a legitimate choice — it is human-readable (you can open a staged
+file and see what's wrong) and needs no `pyarrow` dependency. It is perfectly
+adequate for small, simple data. The cost is a strict, explicit `FILE_FORMAT`:
+
+```sql
+FILE_FORMAT = (TYPE = CSV
+  PARSE_HEADER = TRUE
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+  NULL_IF = ('')
+  EMPTY_FIELD_AS_NULL = FALSE
+  DATE_FORMAT = 'YYYY-MM-DD'
+  TIMESTAMP_FORMAT = 'YYYY-MM-DD HH24:MI:SS.FF9 TZHTZM')
+```
+
+Miss one of those and you get silent bad data rather than an error.
+
+**The one Parquet gotcha:** `pandas.read_sql` returns Postgres `numeric` as
+Python `Decimal`. Make sure `extract_to_files` does not let pandas coerce those
+columns to float before `to_parquet`, or the exact decimal values are lost.
+
+### Other choices
+
+- **ELT, not ETL.** Data lands in `RAW` untransformed; all shaping happens in
+  Snowflake with dbt. Cheaper to re-run, and the raw copy is always there to
+  re-derive from.
+- **Config single-sourced.** `SNOWFLAKE_*` in `.env` feeds both the Airflow
+  connection (assembled in `docker-compose.yaml`) and dbt (`profiles.yml`), so
+  credentials exist once.
+- **Deterministic mimic data.** `setseed()` means bugs are reproducible and
+  diffs are meaningful.
+- **dbt runs in its own container.** Keeps the Airflow image free of dbt's
+  dependency tree; the pipeline launches dbt exactly as a CI job would.
+- **Full snapshot load.** Simplest correct thing. Real pipelines add
+  incremental/CDC logic; that's deliberately left as an exercise.
+
+---
+
+## 5. Repo layout
+
+```
+docker-compose.yaml              adapted from the official Airflow compose (LocalExecutor)
+.env.example                     copy to .env and fill in
 airflow/
   Dockerfile, requirements.txt   custom Airflow image (providers: postgres, snowflake, docker)
-  dags/postgres_to_snowflake.py  ELT skeleton
+  dags/postgres_to_snowflake.py  the ELT DAG
 dbt/
   Dockerfile                     dbt-snowflake image
   dbt_project.yml, profiles.yml  profiles.yml reads SNOWFLAKE_* env vars
-  models/staging, models/marts
-postgres/init/                   SQL run on first source_postgres start
-data/                            extract staging area (gitignored)
+  models/staging/                stg_* views over RAW.* + sources + tests
+  models/marts/                  dim_/fct_ tables + tests
+postgres/init/                   SQL run once on first source_postgres start
+  01_init.sql                    schema app
+  02_insurance_schema.sql        the 7 tables
+  03_insurance_seed.sql          deterministic mimic data (setseed)
+snowflake/
+  bootstrap.sql                  warehouse / database / schemas
+  raw_tables.sql                 RAW.* tables + AIRFLOW_STAGE + PARQUET_FORMAT
+scripts/
+  check_connections.sh           5-hop end-to-end connectivity check
+data/                            Parquet extract staging area (gitignored)
 ```
 
-## Next steps
+### Credentials quick reference
 
-- [ ] Define the business domain + source schema (`postgres/init/`)
-- [ ] Generate mimic data
-- [ ] Fill in `TABLES` and COPY logic in the DAG
-- [ ] Build staging + mart dbt models
+Everything except the Airflow metadata DB comes from `.env`; the values shown
+are what `.env.example` ships.
+
+| Target | Host | Port | db / user / pass |
+| --- | --- | --- | --- |
+| `source_postgres` (from your machine) | `localhost` | `5433` | `insurance` / `insurance_app` / *(your `SOURCE_POSTGRES_PASSWORD`)* |
+| `source_postgres` (inside Compose network) | `source_postgres` | `5432` | same |
+| Airflow metadata DB (internal, not exposed) | `postgres` | `5432` | `airflow` / `airflow` / `airflow` |
+| Airflow UI | `localhost` | `8080` | `admin` / *(your `_AIRFLOW_WWW_USER_PASSWORD`)* |
+| Snowflake | your account | — | `SNOWFLAKE_*` in `.env` |
+
+---
+
+## 6. Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| `docker compose` services never turn healthy | `docker compose logs <service>`; usually `.env` missing `FERNET_KEY` or a bad `SNOWFLAKE_*` value. |
+| DAG import error in the UI | `docker compose exec airflow-scheduler airflow dags list-import-errors` |
+| `dbt_run` / `dbt_test` task fails immediately | `HOST_PROJECT_DIR` not set (or wrong) in `.env` — the `DockerOperator` can't bind-mount `./dbt`. |
+| `COPY INTO` loads 0 rows | Column name mismatch between the Parquet file and the `RAW` table; check `MATCH_BY_COLUMN_NAME`. |
+| Decimal columns look like floats in Snowflake | pandas coerced `numeric` to float in `extract_to_files` — see the Parquet gotcha above. |
+| Want a clean slate | `docker compose down -v && docker compose up -d` (re-runs `postgres/init/`), then re-run `snowflake/raw_tables.sql`. |
+
+---
+
+## 7. Status & next steps
+
+- [x] Local stack (Postgres + Airflow + dbt on Compose)
+- [x] Snowflake bootstrap + `RAW` tables / stage / file format
+- [x] P&C insurance source schema + deterministic mimic data (~1k policies)
+- [x] `postgres_to_snowflake` DAG: extract → stage → `COPY` → dbt
+- [x] dbt project: 7 staging views, 4 marts, ~53 tests
+- [x] End-to-end run green (`dbt run` PASS=11, `dbt test` PASS=53)
+- [ ] Incremental / CDC load instead of full snapshot
+- [ ] A schedule + SLAs
+- [ ] More marts (agent performance, loss ratio by product / cohort)
+- [ ] `dbt source freshness` + `dbt docs` served somewhere
