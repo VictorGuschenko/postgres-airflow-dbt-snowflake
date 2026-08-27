@@ -6,7 +6,7 @@ select
     customer_id,
     agent_id,
     product_id,
-    status                                        as policy_status,
+    status as policy_status,
     effective_date,
     expiration_date,
     annual_premium,

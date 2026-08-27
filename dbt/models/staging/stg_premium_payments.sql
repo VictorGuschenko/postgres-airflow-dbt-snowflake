@@ -7,7 +7,7 @@ select
     due_date,
     paid_date,
     amount,
-    method                                        as payment_method,
-    status                                        as payment_status,
+    method as payment_method,
+    status as payment_status,
     _loaded_at
 from source
