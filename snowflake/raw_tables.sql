@@ -134,3 +134,32 @@ CREATE OR REPLACE TABLE RAW.CLAIM_PAYMENTS (
     _loaded_at        TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
     CONSTRAINT pk_claim_payments PRIMARY KEY (claim_payment_id)
 );
+
+-- ===================== quotes =====================
+CREATE OR REPLACE TABLE RAW.QUOTES (
+    quote_id               NUMBER(38,0)  NOT NULL,
+    quote_number           VARCHAR       NOT NULL,
+    customer_id            NUMBER(38,0)  NOT NULL,
+    agent_id               NUMBER(38,0)  NOT NULL,
+    product_id             NUMBER(38,0)  NOT NULL,
+    status                 VARCHAR       NOT NULL,
+    quoted_annual_premium  NUMBER(10,2)  NOT NULL,
+    created_at             TIMESTAMP_TZ  NOT NULL,
+    decision_date          DATE,
+    converted_policy_id    NUMBER(38,0),
+    _loaded_at             TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_quotes PRIMARY KEY (quote_id)
+);
+
+-- ===================== coverages =====================
+CREATE OR REPLACE TABLE RAW.COVERAGES (
+    coverage_id     NUMBER(38,0)  NOT NULL,
+    policy_id       NUMBER(38,0)  NOT NULL,
+    coverage_code   VARCHAR       NOT NULL,
+    coverage_name   VARCHAR       NOT NULL,
+    limit_amount    NUMBER(12,2)  NOT NULL,
+    deductible      NUMBER(10,2)  NOT NULL,
+    premium_amount  NUMBER(10,2)  NOT NULL,
+    _loaded_at      TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    CONSTRAINT pk_coverages PRIMARY KEY (coverage_id)
+);
