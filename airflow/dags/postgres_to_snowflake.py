@@ -53,6 +53,8 @@ TABLES: dict[str, str] = {
     "app.premium_payments": "PREMIUM_PAYMENTS",
     "app.claims": "CLAIMS",
     "app.claim_payments": "CLAIM_PAYMENTS",
+    "app.quotes": "QUOTES",
+    "app.coverages": "COVERAGES",
 }
 
 DBT_IMAGE = "modern-data-stack/dbt:local"
