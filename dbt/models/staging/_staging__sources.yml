@@ -15,3 +15,5 @@ sources:
       - name: premium_payments
       - name: claims
       - name: claim_payments
+      - name: quotes
+      - name: coverages
