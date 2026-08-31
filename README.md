@@ -14,10 +14,13 @@ source_postgres          Airflow DAG: postgres_to_snowflake                 Snow
                                                               dbt_test ─────────►  ANALYTICS_MARTS    (dim_/fct_ tables)
 ```
 
-**What you practise:** containerised orchestration, an ELT (not ETL) pattern,
-loading Snowflake from an internal stage, why Parquet beats CSV for type-faithful
-loads, dev/prod environment isolation, and a small but complete dbt project
-(sources → staging → marts) with data tests and CI.
+[View the interactive diagram](https://app.diagrams.net/?lightbox=1&highlight=0000ff&layers=1&nav=1#Uhttps%3A%2F%2Fraw.githubusercontent.com%2FVictorGuschenko%2Fpostgres-airflow-dbt-snowflake%2Fmain%2Fdocs%2Fdiagrams%2Fdata_workflow.drawio)
+(source: [`docs/diagrams/data_workflow.drawio`](docs/diagrams/data_workflow.drawio), opens in draw.io)
+
+**What you practise here:** containerised orchestration, an ELT (not ETL)
+pattern, loading Snowflake from an internal stage, why Parquet beats CSV for
+type-faithful loads, and a small but complete dbt project (sources → staging →
+marts) with data tests.
 
 ## Quickstart
 
