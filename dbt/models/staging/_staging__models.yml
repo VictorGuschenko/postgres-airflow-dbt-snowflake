@@ -110,3 +110,49 @@ models:
         tests:
           - accepted_values:
               values: ["INDEMNITY", "EXPENSE"]
+
+  - name: stg_quotes
+    description: One row per quote. Converted quotes link 1:1 to a policy.
+    columns:
+      - name: quote_id
+        tests: [unique, not_null]
+      - name: quote_number
+        tests: [unique, not_null]
+      - name: customer_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+      - name: product_id
+        tests:
+          - relationships:
+              to: ref('stg_products')
+              field: product_id
+      - name: quote_status
+        tests:
+          - accepted_values:
+              values: ["DRAFT", "SENT", "ACCEPTED", "DECLINED", "EXPIRED"]
+      - name: converted_policy_id
+        tests:
+          - relationships:
+              to: ref('stg_policies')
+              field: policy_id
+
+  - name: stg_coverages
+    description: One row per coverage line on a policy.
+    columns:
+      - name: coverage_id
+        tests: [unique, not_null]
+      - name: policy_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_policies')
+              field: policy_id
+      - name: coverage_code
+        tests: [not_null]
+      - name: premium_amount
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"

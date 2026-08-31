@@ -10,7 +10,9 @@ models:
         tests: [not_null]
 
   - name: dim_policies
-    description: Policy dimension enriched with customer, agent and product attributes.
+    description: >
+      Policy dimension enriched with customer, agent, product, coverage roll-ups
+      and the originating quote.
     columns:
       - name: policy_id
         tests: [unique, not_null]
@@ -23,6 +25,54 @@ models:
         tests:
           - accepted_values:
               values: ["AUTO", "HOME", "LIFE", "UMBRELLA"]
+      - name: coverage_count
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "> 0"
+      # The seed splits annual_premium across coverages exactly.
+      - name: total_coverage_premium
+        tests:
+          - dbt_utils.expression_is_true:
+              expression: "= annual_premium"
+
+  - name: fct_quotes
+    description: One row per quote, with funnel measures and the converted policy.
+    columns:
+      - name: quote_id
+        tests: [unique, not_null]
+      - name: quote_status
+        tests:
+          - accepted_values:
+              values: ["DRAFT", "SENT", "ACCEPTED", "DECLINED", "EXPIRED"]
+      - name: converted_policy_id
+        tests:
+          - relationships:
+              to: ref('dim_policies')
+              field: policy_id
+
+  - name: fct_coverages
+    description: One row per coverage line, with policy context.
+    columns:
+      - name: coverage_id
+        tests: [unique, not_null]
+      - name: policy_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_policies')
+              field: policy_id
+
+  - name: fct_agent_performance
+    description: One row per agent — quote conversion, policies written, estimated commission.
+    columns:
+      - name: agent_id
+        tests: [unique, not_null]
+      - name: quote_conversion_rate
+        tests:
+          - dbt_utils.accepted_range:
+              min_value: 0
+              max_value: 1
+              inclusive: true
 
   - name: fct_claims
     description: One row per claim, with policy context and claim-payment roll-ups.
