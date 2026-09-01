@@ -24,5 +24,11 @@ __pycache__/
 *.py[cod]
 .venv/
 
+# Jupyter
+.ipynb_checkpoints/
+.virtual_documents/
+anaconda_projects/
+notebooks/*.csv
+
 # OS
 .DS_Store
